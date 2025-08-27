@@ -1,6 +1,6 @@
 # Hidden Tail Attack
 
-This is the official repository for our paper [Hidden Tail: Adversarial Image Causing Stealthy Resource Consumption in Vision-Language Models]().
+This is the official repository for our paper [Hidden Tail: Adversarial Image Causing Stealthy Resource Consumption in Vision-Language Models](https://arxiv.org/abs/2508.18805).
 
 ## 1. Download Pretrained Models
 
