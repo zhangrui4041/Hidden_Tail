@@ -82,3 +82,16 @@ CUDA_VISIBLE_DEVICES=0 python hidden_tail_attack.py \
     --infer_iter 1000 \
     --print_answer True
 ```
+
+## 5. Citation
+
+If you use our code in your research, please cite:
+
+```bibtex
+@article{zhang2025hidden,
+  title={Hidden Tail: Adversarial Image Causing Stealthy Resource Consumption in Vision-Language Models},
+  author={Zhang, Rui and Wang, Zihan and Yang, Tianli and Li, Hongwei and Jiang, Wenbo and Zhao, Qingchuan and Liu, Yang and Xu, Guowen},
+  journal={arXiv preprint arXiv:2508.18805},
+  year={2025}
+}
+```
