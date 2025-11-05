@@ -1,4 +1,4 @@
-from transformers import AutoProcessor,AutoModel,AutoModelForCausalLM,Blip2ForConditionalGeneration,Blip2Processor
+from transformers import AutoProcessor,AutoModel,AutoModelForCausalLM
 import argparse
 import math
 import torch
@@ -26,8 +26,7 @@ import gc
 import torch._dynamo
 import PIL
 from typing import List, Tuple, Dict
-from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2VLImageProcessor
-from qwen_vl_utils import process_vision_info
+from transformers.image_processing_utils import BaseImageProcessor
 
 torch._dynamo.config.suppress_errors = True
 
@@ -184,8 +183,34 @@ def unnormalize_and_show(image_tensor, processor):
     return displayable_img
 
 
+def tensor_to_pil_gemma3(
+    image_tensor: torch.Tensor,
+    processor: BaseImageProcessor
+) -> Image.Image:
+    """
+    """
+    if not hasattr(processor, 'image_mean') or not hasattr(processor, 'image_std'):
+        raise ValueError("The provided processor is not a valid image processor.")
 
-parser = argparse.ArgumentParser(description="")
+    reverted_tensor = image_tensor.cpu().clone()
+    if reverted_tensor.dim() == 4:
+        reverted_tensor = reverted_tensor.squeeze(0)
+
+    mean = torch.tensor(processor.image_mean).view(3, 1, 1)
+    std = torch.tensor(processor.image_std).view(3, 1, 1)
+    reverted_tensor = reverted_tensor * std + mean
+    reverted_tensor = reverted_tensor / processor.rescale_factor
+    reverted_tensor = torch.clamp(reverted_tensor, 0, 255)
+
+    reverted_tensor = torch.round(reverted_tensor).to(torch.uint8)
+    
+    reverted_tensor = reverted_tensor.permute(1, 2, 0)
+    numpy_array = reverted_tensor.numpy()
+    pil_image = Image.fromarray(numpy_array)
+    return pil_image
+
+
+parser = argparse.ArgumentParser(description="Hidden Tail Attack")
 parser.add_argument("--model", type=str, default='Qwen2.5-VL-7B-Instruct')
 parser.add_argument("--image_id", type=str, default="0")
 parser.add_argument("--text_id", type=str, default="0")
@@ -200,10 +225,6 @@ parser.add_argument("--cuda_device", type=int, default=0)
 parser.add_argument("--debug", type=int, default=0)
 parser.add_argument("--infer_iter", type=int, default=1000)
 parser.add_argument("--print_answer", type=bool, default=False)
-# parser.add_argument("--if_epsilon", type=bool, default=False)
-# parser.add_argument("--if_text_new", type=bool, default=False)
-# parser.add_argument("--if_special_token_new", type=bool, default=False)
-
 
 args = parser.parse_args()
 # Initialize GPU memory monitor
@@ -214,20 +235,32 @@ patch_size = 14
 channel = 3  
 merge_size = 2  
 
-SPECIAL_TOKENLIST = {
-    "im_start":'<|im_start|>',
-    "eos":'<|im_end|>',
-    "object_ref_start":'<|object_ref_start|>',
-    "object_ref_end":'<|object_ref_end|>',
-    "box_start":'<|box_start|>',
-    "box_end":'<|box_end|>',
-    "quad_start":'<|quad_start|>',
-    "quad_end":'<|quad_end|>',
-    "vision_start":'<|vision_start|>',
-    "vision_end":'<|vision_end|>',
-    "vision_pad":'<|vision_pad|>',
-    "image_pad":'<|image_pad|>',
-    "video_pad":'<|video_pad|>',
+# Configure special tokens based on model
+if args.model == "gemma-3-4b-it":
+    SPECIAL_TOKENLIST = {
+        'eos':'<end_of_turn>',
+        # 'bos':'<start_of_turn>',
+        'bos':'<bos>',
+        'pad':'<pad>',
+        'start_of_image':'<start_of_image>',
+        "image_soft_token":'<image_soft_token>',
+        'end_of_image':'<end_of_image>',
+    }
+elif args.model == "Qwen2.5-VL-7B-Instruct" or args.model == "MiMo-VL-7B-RL":
+    SPECIAL_TOKENLIST = {
+        "im_start":'<|im_start|>',
+        "eos":'<|im_end|>',
+        "object_ref_start":'<|object_ref_start|>',
+        "object_ref_end":'<|object_ref_end|>',
+        "box_start":'<|box_start|>',
+        "box_end":'<|box_end|>',
+        "quad_start":'<|quad_start|>',
+        "quad_end":'<|quad_end|>',
+        "vision_start":'<|vision_start|>',
+        "vision_end":'<|vision_end|>',
+        "vision_pad":'<|vision_pad|>',
+        "image_pad":'<|image_pad|>',
+        "video_pad":'<|video_pad|>',
     }
 
 SPECIAL_TOKEN = SPECIAL_TOKENLIST[args.special_token]
@@ -237,8 +270,6 @@ print(f"SPECIAL_TOKEN: {SPECIAL_TOKEN}")
 max_tokens = args.maxtoken
 model_path = f"./LLMs/{args.model}"
 saved_path = f"./log/{args.model}_{args.image_id}_{args.maxtoken}_{args.text_id}_{args.special_token}_{args.alpha}_{args.step}_{args.eos_weight}_{args.epsilon}"
-
-
 
 text_path = f"./text_datasets/{args.model}_{args.image_id}_2048/output.csv" 
 image_path = f"./images/{args.image_id}.jpg"
@@ -259,51 +290,52 @@ class Logger(object):
         self.log.flush()
 
 file_name = 'process'
-# saved_path = args.saved_path
 os.makedirs(saved_path, exist_ok=True)
 sys.stdout = Logger(f'{saved_path}/{file_name}.log')
 
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    model_path,
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
-    device_map="sequential"
-)
+# Load model based on type
+if args.model == "Qwen2.5-VL-7B-Instruct" or args.model == "MiMo-VL-7B-RL":
+    from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2VLImageProcessor
+    from qwen_vl_utils import process_vision_info
+    
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        device_map="sequential"
+    )
+elif args.model == "gemma-3-4b-it":
+    from transformers import Gemma3ForConditionalGeneration, Gemma3Processor
+    
+    model = Gemma3ForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        device_map="auto"
+    )
 
-
+print(f'Model loaded: {args.model}')
 print('Using flash attention!')
 
 processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
 
-# print(f"processor: {processor.__class__.__name__}")
-# print(f"processor.image_processor: {processor.image_processor.__class__.__name__}")
-
 special_token_id = processor.tokenizer(SPECIAL_TOKEN, add_special_tokens=False)['input_ids'][0]
 # ---------- Load data ----------
-# data_path = args.data
 data = pd.read_csv(text_path, header=0)
-# print(f"data: {data}")
 data.columns = data.columns.str.strip()
 print(f"len(data): {len(data)}")
 questions = data["question"].tolist()
 special_token_length = 1024
 answers = [str(a) for a in data["answer"]] # concatenated
-# print(f"answers: {answers}")
 # ---------- Load image and process ----------
-# image_path = args.image_path
 image = Image.open(image_path).convert("RGB")  # ensure RGB format
 width_pull, height_pull = image.size
-# resized_height, resized_width = smart_resize(height = height_pull, width = width_pull)
 
-image_tensor = processor.image_processor(image, return_tensors="pt").pixel_values.to("cuda")  # preprocess image
-
-# print(f"image_tensor.shape: {image_tensor.shape}")
-# print(f"image_tensor: {image_tensor}")
+# Preprocess image based on model
+image_tensor = processor.image_processor(image, return_tensors="pt").pixel_values.to("cuda")
 
 # ---------- Adversarial parameters ----------
-
 epsilon = args.epsilon/255 # adversarial perturbation constraint
-
 alpha = 1/255
 num_iter = args.step
 batch_size = 1
@@ -325,14 +357,13 @@ if args.resume_training == 1:
 else:
     adv_noise_loaded = None
     start_iter = 0
-    print("resume training but no checkpoint detected, start from scratch.")
+    print("no resume training, start from scratch.")
 
 # initialize noise
 if adv_noise_loaded is not None:
     adv_noise = adv_noise_loaded.clone().detach()
 else:
     adv_noise = torch.rand_like(image_tensor).to("cuda") * 2 * epsilon - epsilon
-
 
 adv_noise = adv_noise.to("cuda")
 adv_noise.requires_grad_(True)
@@ -365,32 +396,50 @@ for t in tqdm(range(start_iter, num_iter)):
         selected_question = questions[idx]
         special_answer = SPECIAL_TOKEN*special_token_length
 
-        messages = [
-            {
-                "role": "user",
-                "content": 
-                [   
-                    {"type": "text", "text": selected_question},
-                    {"type": "image", "image": image_path},
-                ],
-            }
-        ]
+        # Construct messages based on model type
+        if args.model == "Qwen2.5-VL-7B-Instruct" or args.model == "MiMo-VL-7B-RL":
+            messages = [
+                {
+                    "role": "user",
+                    "content": 
+                    [   
+                        {"type": "text", "text": selected_question},
+                        {"type": "image", "image": image_path},
+                    ],
+                }
+            ]
             
-        prompt = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages) # get resized image
+            prompt = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs = process_vision_info(messages) # get resized image
             
-        # construct input
-        inputs = processor(
-            text = prompt,
-            images = image_inputs,
-            padding = True,
-            return_tensors = "pt",
-        ).to("cuda", torch.float16)
+            # construct input
+            inputs = processor(
+                text = prompt,
+                images = image_inputs,
+                padding = True,
+                return_tensors = "pt",
+            ).to("cuda", torch.float16)
             
-        inputs["pixel_values"] += adv_noise # optimized and generated use the same code
+            inputs["pixel_values"] += adv_noise # optimized and generated use the same code
             
+        elif args.model == "gemma-3-4b-it":
+            messages = [
+                {
+                    "role": "user",
+                    "content": 
+                    [   
+                        {"type": "text", "text": selected_question},
+                        {"type": "image", "image": image_path},
+                    ],
+                }
+            ]
+            inputs = processor.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=True,
+                return_dict=True, return_tensors="pt"
+            ).to("cuda", torch.float16)
+            inputs["pixel_values"] += adv_noise
 
         prompt_length = inputs["input_ids"].shape[1]
 
@@ -404,8 +453,6 @@ for t in tqdm(range(start_iter, num_iter)):
         combined_input_ids = torch.cat([inputs["input_ids"], target_answer_tokens, special_answer_tokens], dim=1)
         combined_attention_mask = torch.cat([inputs["attention_mask"], torch.ones_like(target_answer_tokens), torch.ones_like(special_answer_tokens)], dim=1) 
 
-
-
         labels_full = combined_input_ids.clone()
         labels_full[:, :prompt_length] = -100
         labels_ref = labels_full.clone()
@@ -414,7 +461,6 @@ for t in tqdm(range(start_iter, num_iter)):
         # update inputs
         inputs["input_ids"] = combined_input_ids
         inputs["attention_mask"] = combined_attention_mask
-
 
         outputs = model(**inputs)
         logits = outputs.logits  # [B, L, V]
@@ -425,7 +471,6 @@ for t in tqdm(range(start_iter, num_iter)):
         
         active_logits = logits[active_mask]
         active_labels = labels_full[active_mask]
-                
 
         # calculate loss for each token
         loss_fct = CrossEntropyLoss(reduction='none')
@@ -487,14 +532,12 @@ for t in tqdm(range(start_iter, num_iter)):
     
     # calculate average loss
     target_loss /= batch_size
-    # total_weighted_loss /= batch_size
     total_eos_penalty /= batch_size
     total_lossANS /= batch_size
     total_lossSPE /= batch_size
     
     target_loss.requires_grad_(True)
     target_loss.backward() 
-    # retain_graph=True
 
     # update noise
     with torch.no_grad():
@@ -507,41 +550,52 @@ for t in tqdm(range(start_iter, num_iter)):
     print(f"[{t}] final loss: {loss.item():.4f}, weight ANS: {weights[0] * lossANS.item():.4f}, weight SPE: {args.alpha * weights[1] * lossSPE.item():.4f}, weight EOS: {args.eos_weight * weights[2] * eos_penalty.item():.4f}")
     
     
-    if (t+1) % args.infer_iter == 0: # every 1000 iterations, do full 60 samples inference
+    if (t+1) % args.infer_iter == 0: # every infer_iter iterations, do full inference
         print('######### full inference test - Iter = %d ##########' % t)        
         # save current iteration's adversarial noise
         torch.save(adv_noise, f'{saved_path}/adv_img_{t}.pt')
         print(f"adversarial noise saved: adv_img_{t}.pt")
         
         # save current iteration's image
-        inverse_processor = Qwen2VLImageProcessor.from_pretrained(f"./LLMs/{args.model}")
+        if args.model == "Qwen2.5-VL-7B-Instruct" or args.model == "MiMo-VL-7B-RL":
+            inverse_processor = Qwen2VLImageProcessor.from_pretrained(f"./LLMs/{args.model}")
 
-        processed_output, grid_thw = inverse_processor._preprocess(
-            image,
-            do_resize=inverse_processor.do_resize,
-            size=inverse_processor.size,
-            resample=inverse_processor.resample,
-            do_rescale=inverse_processor.do_rescale,
-            rescale_factor=inverse_processor.rescale_factor,
-            do_normalize=inverse_processor.do_normalize,
-            image_mean=inverse_processor.image_mean,
-            image_std=inverse_processor.image_std,
-            patch_size=inverse_processor.patch_size,
-            temporal_patch_size=inverse_processor.temporal_patch_size, 
-            merge_size=inverse_processor.merge_size,
-            do_convert_rgb=inverse_processor.do_convert_rgb,
-        )
-        noise = adv_noise.to("cpu")
-        noise = noise.detach().numpy()
-        input = processed_output + noise
-        restored_4d_tensor = unflatten_patches(
-            flattened_patches=input,
-            grid_dims=grid_thw,
-            config=inverse_processor
-        )
-        displayable_img = unnormalize_and_show(restored_4d_tensor, inverse_processor)
-        PIL.Image.fromarray(displayable_img).save(f"{saved_path}/adv_img_{t}.bmp")
-        print(f"adversarial noise saved: adv_img_{t}.bmp")
+            processed_output, grid_thw = inverse_processor._preprocess(
+                image,
+                do_resize=inverse_processor.do_resize,
+                size=inverse_processor.size,
+                resample=inverse_processor.resample,
+                do_rescale=inverse_processor.do_rescale,
+                rescale_factor=inverse_processor.rescale_factor,
+                do_normalize=inverse_processor.do_normalize,
+                image_mean=inverse_processor.image_mean,
+                image_std=inverse_processor.image_std,
+                patch_size=inverse_processor.patch_size,
+                temporal_patch_size=inverse_processor.temporal_patch_size, 
+                merge_size=inverse_processor.merge_size,
+                do_convert_rgb=inverse_processor.do_convert_rgb,
+            )
+            noise = adv_noise.to("cpu")
+            noise = noise.detach().numpy()
+            input = processed_output + noise
+            restored_4d_tensor = unflatten_patches(
+                flattened_patches=input,
+                grid_dims=grid_thw,
+                config=inverse_processor
+            )
+            displayable_img = unnormalize_and_show(restored_4d_tensor, inverse_processor)
+            PIL.Image.fromarray(displayable_img).save(f"{saved_path}/adv_img_{t}.bmp")
+            print(f"adversarial image saved: adv_img_{t}.bmp")
+            
+        elif args.model == "gemma-3-4b-it":
+            inverse_processor = AutoProcessor.from_pretrained(f"./LLMs/{args.model}", trust_remote_code=True)
+            inputs_for_save = processor.image_processor(images=image, return_tensors="pt")
+            noise = adv_noise.to("cpu")
+            noise = noise.detach().numpy()
+            adv_image_tensor = inputs_for_save["pixel_values"] + noise
+            restored_results = tensor_to_pil_gemma3(adv_image_tensor, processor.image_processor)
+            restored_results.save(f"{saved_path}/adv_img_{t}.bmp", format="BMP")
+            print(f"adversarial image saved: adv_img_{t}.bmp")
         
         print("\n========== start inference for last 20 samples ==========")
         # start memory monitoring
@@ -556,47 +610,74 @@ for t in tqdm(range(start_iter, num_iter)):
             true_answer = answers[idx]
             
             # construct different message formats and inputs for different models
-            messages = [
-                {
-                    "role": "user",
-                    "content": 
-                    [   
-                        {"type": "text", "text": question},
-                        {"type": "image", "image": test_image},
-                    ],
-                }
-            ]
+            if args.model == "Qwen2.5-VL-7B-Instruct" or args.model == "MiMo-VL-7B-RL":
+                messages = [
+                    {
+                        "role": "user",
+                        "content": 
+                        [   
+                            {"type": "text", "text": question},
+                            {"type": "image", "image": test_image},
+                        ],
+                    }
+                ]
                 
-            # process prompt
-            prompt = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+                # process prompt
+                prompt = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
                 
-            image_inputs, video_inputs = process_vision_info(messages) # get resized image
-            
-            inputs = processor(
-                text = prompt,
-                images = image_inputs,
-                padding = True,
-                return_tensors = "pt",
-            ).to("cuda") 
+                image_inputs, video_inputs = process_vision_info(messages) # get resized image
+                
+                inputs = processor(
+                    text = prompt,
+                    images = image_inputs,
+                    padding = True,
+                    return_tensors = "pt",
+                ).to("cuda") 
 
-            response = model.generate(
-                **inputs,
-                do_sample=False,
-                max_new_tokens=max_tokens
-            )
+                response = model.generate(
+                    **inputs,
+                    do_sample=False,
+                    max_new_tokens=max_tokens
+                )
 
-            # decode generated text
-            generated_text_true = processor.decode(
-                response[0][inputs['input_ids'].shape[-1]:], 
-                skip_special_tokens=True
-            )
-            generated_text_false = processor.decode(
-                response[0][inputs['input_ids'].shape[-1]:], 
-                skip_special_tokens=False
-            )
-            token_count = len(response[0][inputs['input_ids'].shape[-1]:])      
+                # decode generated text
+                generated_text_true = processor.decode(
+                    response[0][inputs['input_ids'].shape[-1]:], 
+                    skip_special_tokens=True
+                )
+                generated_text_false = processor.decode(
+                    response[0][inputs['input_ids'].shape[-1]:], 
+                    skip_special_tokens=False
+                )
+                token_count = len(response[0][inputs['input_ids'].shape[-1]:])
+                
+            elif args.model == "gemma-3-4b-it":
+                messages = [
+                    {
+                        "role": "user",
+                        "content": 
+                        [   
+                            {"type": "text", "text": question},
+                            {"type": "image", "image": test_image},
+                        ],
+                    }
+                ]
+                inputs = processor.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=True,
+                    return_dict=True, return_tensors="pt"
+                ).to("cuda", dtype=torch.bfloat16)
+                
+                input_len = inputs["input_ids"].shape[-1]
+                
+                with torch.inference_mode():
+                    generation = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False)
+                    generation = generation[0][input_len:]
+
+                    generated_text_true = processor.decode(generation, skip_special_tokens=True).strip()
+                    generated_text_false = processor.decode(generation, skip_special_tokens=False).strip()
+                    token_count = generation.shape[0]
                            
             inference_end_time = time.time()
             inference_duration = inference_end_time - inference_start_time            
@@ -682,7 +763,7 @@ print("=================================")
 # collect and summarize all memory statistics for inference stages
 print("\n========== memory usage summary ==========")
 memory_summary_files = []
-for i in range(start_iter + 999, num_iter, 1000):  # find all 1000-multiple iterations
+for i in range(start_iter + args.infer_iter - 1, num_iter, args.infer_iter):  # find all infer_iter-multiple iterations
     memory_file = f'{saved_path}/memory_stats_iter_{i}.txt'
     if os.path.exists(memory_file):
         memory_summary_files.append(memory_file)
@@ -750,7 +831,7 @@ if memory_summary_files:
             
         f.write("detailed data for each iteration:\n")
         for i, (max_mem, avg_mem, min_mem) in enumerate(zip(all_max_memory, all_avg_memory, all_min_memory)):
-            iter_num = (start_iter + 999) + i * 1000
+            iter_num = (start_iter + args.infer_iter - 1) + i * args.infer_iter
             f.write(f"  Iter {iter_num}: Max={max_mem:.2f}GB, Avg={avg_mem:.2f}GB, Min={min_mem:.2f}GB\n")
     
     print(f"memory usage summary report saved to: {summary_file}")
@@ -758,7 +839,7 @@ else:
     print("no inference stage memory statistics files found")
 print("=" * 50)
 
-# 保存最终的对抗扰动
+# save final adversarial noise
 final_adv_path = f'{saved_path}/final_adv_noise.pt'
 torch.save(adv_noise, final_adv_path)
 print(f"final adversarial noise saved to: {final_adv_path}")
@@ -770,5 +851,4 @@ print("adversarial noise files: adv_noise_iter_*.pt")
 print("final adversarial noise file: final_adv_noise.pt")
 print(f"memory statistics files: {saved_path}/memory_stats_iter_*.txt")
 print(f"memory usage summary file: {saved_path}/memory_usage_summary.txt")
-
 
