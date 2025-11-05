@@ -9,6 +9,7 @@ First, download the required VLMs from Huggingface:
 ```bash
 huggingface-cli download --resume-download Qwen/Qwen2.5-VL-7B-Instruct --local-dir ./LLMs/Qwen2.5-VL-7B-Instruct
 huggingface-cli download --resume-download XiaomiMiMo/MiMo-VL-7B-RL --local-dir ./LLMs/MiMo-VL-7B-RL
+huggingface-cli download --resume-download google/gemma-3-4b-it --local-dir ./LLMs/gemma-3-4b-it
 ```
 
 ## 2. Environment Setup
@@ -26,7 +27,7 @@ This will install all required dependencies with the correct versions.
 
 A demo script `demo.ipynb` is provided to directly perform inference using pre-generated adversarial images. 
 
-Or you can also try these images (see `./adv_images`) on https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct.
+Or you can also try these images (see `./adv_image`) on https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct.
 
 
 ## 4. Run the Attack Script
@@ -44,7 +45,7 @@ CUDA_VISIBLE_DEVICES=0 python hidden_tail_attack.py \
     --step 5000 \
     --eos_weight 10000 \
     --epsilon 64 \
-    --infer_iter 500 \
+    --infer_iter 1000 \
     --print_answer True
 ```
 
@@ -61,7 +62,23 @@ CUDA_VISIBLE_DEVICES=0 python hidden_tail_attack.py \
     --step 5000 \
     --eos_weight 10000 \
     --epsilon 64 \
-    --infer_iter 500 \
+    --infer_iter 1000 \
     --print_answer True
 ```
 
+Example for gemma-3-4b-it:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python hidden_tail_attack.py \
+    --model gemma-3-4b-it \
+    --image_id 0 \
+    --text_id 0 \
+    --maxtoken 2048 \
+    --special_token bos \
+    --alpha 1000 \
+    --step 5000 \
+    --eos_weight 1000 \
+    --epsilon 64 \
+    --infer_iter 1000 \
+    --print_answer True
+```
